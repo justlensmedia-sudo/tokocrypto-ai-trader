@@ -1,0 +1,13 @@
+{
+  "name": "tokocrypto-ai-trader-bot",
+  "version": "1.0.0",
+  "description": "Tokocrypto AI Trader 24/7 Cloud Bot with Gemini AI & Telegram",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "node-cron": "^3.0.3"
+  }
+}
