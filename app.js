@@ -1,7 +1,6 @@
 const express = require('express');
 const https = require('https');
 const crypto = require('crypto');
-const cron = require('node-cron');
 
 const app = express();
 app.use(express.json());
@@ -13,7 +12,6 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const MODAL_MAX_IDR = Number(process.env.MODAL_MAX_IDR || 87000);
-const APP_URL = process.env.RENDER_EXTERNAL_URL || process.env.APP_URL;
 
 // Helper HTTP Request
 function request(url, options = {}, data = null) {
@@ -98,18 +96,18 @@ async function tokoSignedRequest(endpoint, queryParams = {}, method = 'GET') {
   });
 }
 
-// 4. Analisa Pasar & Kirim Sinyal (Jalan Tiap 15 Menit)
-async function runMarketAnalysis() {
-  console.log('[CRON 15M] Menjalankan Analisa Pasar AI...');
+// ==========================================
+// ROUTE 1: ANALISA PASAR (TIAP 5 MENIT)
+// ==========================================
+async function handleMarketAnalysis(req, res) {
+  console.log('[CRON 5M] Menjalankan Analisa Pasar AI (Filter Anti-Spam)...');
   try {
-    // A. Cek Saldo
     const spot = await tokoSignedRequest('/open/v1/account/spot');
     const assets = spot.data?.data?.accountAssets || [];
     const idrAsset = assets.find(a => a.asset === 'BIDR' || a.asset === 'IDR');
     const idrFree = idrAsset ? parseFloat(idrAsset.free) : 0;
     const availableBuy = Math.min(idrFree > 0 ? idrFree : MODAL_MAX_IDR, MODAL_MAX_IDR);
 
-    // Cek Koin yang Dipegang
     const heldCoin = assets.find(a => a.asset !== 'BIDR' && a.asset !== 'IDR' && a.asset !== 'USDT' && parseFloat(a.free) > 0);
     let mode = 'CARI_PELUANG_BARU';
     let symbol = 'BTC_IDR';
@@ -123,25 +121,42 @@ async function runMarketAnalysis() {
       coinQty = parseFloat(heldCoin.free);
     }
 
-    // B. Ambil Harga Live Tokocrypto
     const depth = await request(`https://www.tokocrypto.com/open/v1/market/depth?symbol=${symbol}&limit=5`);
     const lastPrice = depth.data?.data?.bids?.[0]?.[0] || '1400000000';
+    const numPrice = Number(lastPrice);
 
-    // C. Ambil 100 Candlestick & Hitung SMA
     const klinesRes = await request(`https://api.binance.com/api/v3/klines?symbol=${binanceSymbol}&interval=1h&limit=100`);
     const klines = Array.isArray(klinesRes.data) ? klinesRes.data : [];
     const closes = klines.map(k => parseFloat(k[4]));
 
     const sma7 = (closes.slice(-7).reduce((a, b) => a + b, 0) / 7) || 0;
     const sma25 = (closes.slice(-25).reduce((a, b) => a + b, 0) / 25) || 0;
-    const trend = sma7 > sma25 ? 'BULLISH' : 'BEARISH';
+    const isGoldenCross = sma7 > sma25;
+    const trend = isGoldenCross ? 'BULLISH' : 'BEARISH';
 
-    // D. Analisa Gemini AI
-    let action = trend === 'BULLISH' ? (mode === 'EVALUASI_KOIN_DIPEGANG' ? 'HOLD' : 'BUY') : (mode === 'EVALUASI_KOIN_DIPEGANG' ? 'SELL' : 'HOLD');
-    let reason = `Indikator SMA7 (${sma7.toFixed(2)}) vs SMA25 (${sma25.toFixed(2)}) mendeteksi momentum ${trend}.`;
+    let action = 'HOLD';
+    let reason = 'Pasar dalam konsolidasi netral.';
+
+    if (mode === 'CARI_PELUANG_BARU') {
+      if (isGoldenCross) {
+        action = 'BUY';
+        reason = `Golden Cross SMA7 (${sma7.toFixed(2)}) > SMA25 (${sma25.toFixed(2)}). Peluang cuan Bullish.`;
+      } else {
+        action = 'HOLD';
+        reason = `SMA masih Bearish (${sma7.toFixed(2)} < ${sma25.toFixed(2)}). Menunggu titik konfirmasi.`;
+      }
+    } else {
+      if (!isGoldenCross) {
+        action = 'SELL';
+        reason = `Momentum berbalik Bearish (Death Cross). Jual untuk mengamankan profit/modal.`;
+      } else {
+        action = 'HOLD';
+        reason = `Tren Bullish kuat. Tetap HOLD untuk memaksimalkan cuan.`;
+      }
+    }
 
     if (GEMINI_API_KEY) {
-      const prompt = `Data teknikal: symbol=${symbol}, harga terakhir=Rp${Number(lastPrice).toLocaleString('id-ID')}, SMA7=${sma7.toFixed(2)}, SMA25=${sma25.toFixed(2)}, trend=${trend}. Status akun: ${mode}. Modal trading: Rp${availableBuy.toLocaleString('id-ID')}. Berikan rekomendasi (${mode === 'CARI_PELUANG_BARU' ? 'BUY atau HOLD' : 'SELL atau HOLD'}) dan alasan profesional maks 2 kalimat. Balas HANYA JSON: {"action":"BUY|SELL|HOLD","reason":"alasan"}`;
+      const prompt = `Data teknikal: symbol=${symbol}, harga terakhir=Rp${numPrice.toLocaleString('id-ID')}, SMA7=${sma7.toFixed(2)}, SMA25=${sma25.toFixed(2)}, trend=${trend}. Status posisi: ${mode}. Modal: Rp${availableBuy.toLocaleString('id-ID')}. Berikan rekomendasi (${mode === 'CARI_PELUANG_BARU' ? 'BUY atau HOLD' : 'SELL atau HOLD'}) dan alasan ringkas maks 2 kalimat. Format HANYA JSON: {"action":"BUY|SELL|HOLD","reason":"alasan"}`;
       const aiRes = await request(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${GEMINI_API_KEY}`,
         {
@@ -161,72 +176,151 @@ async function runMarketAnalysis() {
       } catch (e) {}
     }
 
-    // E. Susun Tombol & Kirim Telegram
+    if (action === 'HOLD') {
+      console.log('[ANTI-SPAM] HOLD - Tidak kirim Telegram.');
+      return res.status(200).json({ success: true, notified: false, action: 'HOLD' });
+    }
+
     let buttons;
-    let statusLabel;
-    if (mode === 'EVALUASI_KOIN_DIPEGANG') {
-      statusLabel = `Sedang memegang ${coinQty} ${heldCoin.asset}`;
+    let titleHeader;
+    if (action === 'BUY') {
+      titleHeader = `🚀 *PELUANG CUAN DETECTED (BUY SIGNAL)*`;
       buttons = [
         [
-          { text: '❌ SELL SEMUA', callback_data: `SELL_${symbol}_ALL` },
-          { text: '⏸ HOLD', callback_data: `HOLD_${symbol}_0` }
+          { text: `✅ EKSEKUSI BUY (Rp${availableBuy.toLocaleString('id-ID')})`, callback_data: `BUY_${symbol}_${availableBuy}` },
+          { text: `⏸ ABAIKAN / HOLD`, callback_data: `HOLD_${symbol}_0` }
         ]
       ];
-    } else {
-      statusLabel = 'Kandidat beli baru (belum ada posisi)';
+    } else if (action === 'SELL') {
+      titleHeader = `💰 *SINYAL AMANKAN CUAN (SELL SIGNAL)*`;
       buttons = [
         [
-          { text: `✅ BUY (${action === 'BUY' ? 'Rekomendasi AI' : 'Manual'})`, callback_data: `BUY_${symbol}_${availableBuy}` },
-          { text: '⏸ HOLD', callback_data: `HOLD_${symbol}_0` }
+          { text: `❌ EKSEKUSI SELL SEMUA (${coinQty} ${heldCoin.asset})`, callback_data: `SELL_${symbol}_ALL` },
+          { text: `⏸ LANJUTKAN HOLD`, callback_data: `HOLD_${symbol}_0` }
         ]
       ];
     }
 
-    const msg = `📊 *Sinyal Trading AI Tokocrypto (24/7 Cloud)*\n\n` +
+    const msg = `${titleHeader}\n\n` +
       `Aset: *${symbol}*\n` +
-      `Status: ${statusLabel}\n` +
-      `Harga: *Rp${Number(lastPrice).toLocaleString('id-ID')}*\n` +
-      `Rekomendasi: *${action}*\n` +
-      `Alasan: _${reason}_\n\n` +
-      (mode !== 'EVALUASI_KOIN_DIPEGANG' ? `💰 Alokasi Modal: Rp${availableBuy.toLocaleString('id-ID')}\n\n` : '') +
-      `_Klik tombol di bawah untuk eksekusi:_`;
+      `Harga: *Rp${numPrice.toLocaleString('id-ID')}*\n` +
+      `Indikator: *${trend}* (SMA7: ${sma7.toFixed(2)} | SMA25: ${sma25.toFixed(2)})\n` +
+      `Analisa AI: _${reason}_\n\n` +
+      (action === 'BUY' ? `💰 Rekomendasi Modal: *Rp${availableBuy.toLocaleString('id-ID')}*\n\n` : `📦 Jumlah Koin: *${coinQty} ${heldCoin?.asset}*\n\n`) +
+      `_Klik tombol di bawah untuk eksekusi langsung:_`;
 
     await sendTelegram(msg, { inline_keyboard: buttons });
-    console.log(`[CRON 15M] Sinyal ${symbol} [${action}] berhasil dikirim ke Telegram.`);
+    return res.status(200).json({ success: true, notified: true, symbol, action });
   } catch (err) {
-    console.error('[CRON 15M] Error:', err.message);
+    console.error('Error in market analysis:', err.message);
+    return res.status(500).json({ success: false, error: err.message });
   }
 }
 
-// 5. Eksekusi Order saat Tombol Ditekan (Webhook Callback)
-app.post('/webhook', async (req, res) => {
-  res.sendStatus(200);
+// ==========================================
+// ROUTE 2: BERITA PASAR KRIPTO (TIAP 2 JAM)
+// ==========================================
+async function handleNewsDigest(req, res) {
+  console.log('[NEWS 2H] Mengambil Ringkasan Berita & Kondisi Pasar Kripto...');
+  try {
+    const [btcRes, ethRes, solRes] = await Promise.all([
+      request('https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT'),
+      request('https://api.binance.com/api/v3/ticker/24hr?symbol=ETHUSDT'),
+      request('https://api.binance.com/api/v3/ticker/24hr?symbol=SOLUSDT')
+    ]);
+
+    const btc = btcRes.data || { lastPrice: '0', priceChangePercent: '0' };
+    const eth = ethRes.data || { lastPrice: '0', priceChangePercent: '0' };
+    const sol = solRes.data || { lastPrice: '0', priceChangePercent: '0' };
+
+    const kursUsdIdr = 16200;
+    const btcIdr = (parseFloat(btc.lastPrice) * kursUsdIdr).toLocaleString('id-ID');
+    const ethIdr = (parseFloat(eth.lastPrice) * kursUsdIdr).toLocaleString('id-ID');
+    const solIdr = (parseFloat(sol.lastPrice) * kursUsdIdr).toLocaleString('id-ID');
+
+    let newsSnippets = 'Pergerakan pasar didorong oleh likuiditas makro dan arus masuk ETF kripto.';
+    try {
+      const cryptoPanic = await request('https://cryptopanic.com/api/free/v1/posts/?auth_token=free&public=true&filter=hot');
+      const posts = cryptoPanic.data?.results || [];
+      if (posts.length > 0) {
+        newsSnippets = posts.slice(0, 4).map((p, idx) => `${idx + 1}. ${p.title}`).join('\n');
+      }
+    } catch (e) {}
+
+    let aiSummary = 'Pasar kripto bergerak konsolidatif dengan volatilitas normal dalam 24 jam terakhir.';
+    if (GEMINI_API_KEY) {
+      const prompt = `Anda adalah analis pasar kripto profesional. Berikut data pasar terkini:
+- BTC: $${parseFloat(btc.lastPrice).toLocaleString('en-US')} (${parseFloat(btc.priceChangePercent) >= 0 ? '+' : ''}${parseFloat(btc.priceChangePercent).toFixed(2)}%)
+- ETH: $${parseFloat(eth.lastPrice).toLocaleString('en-US')} (${parseFloat(eth.priceChangePercent) >= 0 ? '+' : ''}${parseFloat(eth.priceChangePercent).toFixed(2)}%)
+- SOL: $${parseFloat(sol.lastPrice).toLocaleString('en-US')} (${parseFloat(sol.priceChangePercent) >= 0 ? '+' : ''}${parseFloat(sol.priceChangePercent).toFixed(2)}%)
+Berita terhangat:
+${newsSnippets}
+
+Tolong buatkan rangkuman berita dan sentimen pasar kripto dalam 3 poin singkat, padat, dan menarik dalam Bahasa Indonesia. Format HANYA teks poin 1, 2, 3 tanpa embel-embel markdown rumit.`;
+
+      const aiRes = await request(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${GEMINI_API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' }
+        },
+        { contents: [{ parts: [{ text: prompt }] }] }
+      );
+      const aiText = aiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (aiText) aiSummary = aiText.trim();
+    }
+
+    const now = new Date();
+    const waktuWib = now.toLocaleTimeString('id-ID', { timeZone: 'Asia/Jakarta', hour: '2-digit', minute: '2-digit' });
+
+    const msg = `📰 *UPDATE PASAR & BERITA KRIPTO (Tiap 2 Jam)*\n` +
+      `🕒 _Waktu: ${waktuWib} WIB_\n\n` +
+      `📈 *Kondisi Harga Koin Utama:*\n` +
+      `• *BTC*: $${parseFloat(btc.lastPrice).toLocaleString('en-US')} (~Rp${btcIdr}) [${parseFloat(btc.priceChangePercent) >= 0 ? '🟢 +' : '🔴 '}${parseFloat(btc.priceChangePercent).toFixed(2)}%]\n` +
+      `• *ETH*: $${parseFloat(eth.lastPrice).toLocaleString('en-US')} (~Rp${ethIdr}) [${parseFloat(eth.priceChangePercent) >= 0 ? '🟢 +' : '🔴 '}${parseFloat(eth.priceChangePercent).toFixed(2)}%]\n` +
+      `• *SOL*: $${parseFloat(sol.lastPrice).toLocaleString('en-US')} (~Rp${solIdr}) [${parseFloat(sol.priceChangePercent) >= 0 ? '🟢 +' : '🔴 '}${parseFloat(sol.priceChangePercent).toFixed(2)}%]\n\n` +
+      `🤖 *Rangkuman Berita & Analisa AI:*\n` +
+      `${aiSummary}\n\n` +
+      `ℹ️ _Pesan ini bersifat informatif & edukatif berkala._`;
+
+    await sendTelegram(msg);
+    return res.status(200).json({ success: true, service: 'Crypto News Digest 2H', timestamp: now.toISOString() });
+  } catch (err) {
+    console.error('Error in news handler:', err.message);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+}
+
+// ==========================================
+// ROUTE 3: WEBHOOK TELEGRAM (TOMBOL ORDER)
+// ==========================================
+async function handleWebhook(req, res) {
+  if (req.method !== 'POST') return res.status(200).json({ status: 'Webhook endpoint ready' });
+
   const cb = req.body?.callback_query;
-  if (!cb) return;
+  if (!cb) return res.status(200).send('OK');
 
   const callbackData = cb.data;
   const callbackId = cb.id;
-  console.log('[WEBHOOK TELEGRAM] Tombol ditekan:', callbackData);
 
   try {
     const parts = callbackData.split('_');
-    const side = parts[0]; // BUY / SELL / HOLD
-    const symbol = `${parts[1]}_${parts[2]}`; // e.g. BTC_IDR
+    const side = parts[0];
+    const symbol = `${parts[1]}_${parts[2]}`;
     const amount = parts[3];
 
     if (side === 'HOLD') {
       await answerCallback(callbackId, 'Posisi HOLD dikonfirmasi.');
-      await sendTelegram(`⏸ *HOLD Dikonfirmasi*\n\nTidak ada order baru untuk *${symbol}*. Posisi aman.`);
-      return;
+      await sendTelegram(`⏸ *HOLD Dikonfirmasi*\n\nTidak ada order baru untuk *${symbol}*.`);
+      return res.status(200).send('OK');
     }
 
     if (side === 'BUY') {
       await answerCallback(callbackId, 'Memproses BUY Tokocrypto...');
-      // Eksekusi Order Market BUY ke Tokocrypto
       const buyParams = {
         symbol: symbol,
-        side: 0, // 0 = BUY
-        type: 2, // 2 = MARKET
+        side: 0,
+        type: 2,
         quoteOrderQty: Math.min(Number(amount || MODAL_MAX_IDR), MODAL_MAX_IDR)
       };
 
@@ -236,12 +330,11 @@ app.post('/webhook', async (req, res) => {
       } else {
         await sendTelegram(`⚠️ *ORDER BUY GAGAL*\n\nDetail: ${orderRes.data?.msg || orderRes.raw}`);
       }
-      return;
+      return res.status(200).send('OK');
     }
 
     if (side === 'SELL') {
       await answerCallback(callbackId, 'Memproses SELL Tokocrypto...');
-      // Ambil saldo koin terkini
       const spot = await tokoSignedRequest('/open/v1/account/spot');
       const baseAsset = parts[1];
       const coin = (spot.data?.data?.accountAssets || []).find(a => a.asset === baseAsset);
@@ -249,13 +342,13 @@ app.post('/webhook', async (req, res) => {
 
       if (qty <= 0) {
         await sendTelegram(`⚠️ *SELL Dibatalkan*: Tidak ada saldo ${baseAsset} di akun.`);
-        return;
+        return res.status(200).send('OK');
       }
 
       const sellParams = {
         symbol: symbol,
-        side: 1, // 1 = SELL
-        type: 2, // 2 = MARKET
+        side: 1,
+        type: 2,
         quantity: qty
       };
 
@@ -265,61 +358,28 @@ app.post('/webhook', async (req, res) => {
       } else {
         await sendTelegram(`⚠️ *ORDER SELL GAGAL*\n\nDetail: ${orderRes.data?.msg || orderRes.raw}`);
       }
+      return res.status(200).send('OK');
     }
   } catch (err) {
-    console.error('Error handling callback:', err.message);
+    console.error('Error handling webhook:', err.message);
     await answerCallback(callbackId, 'Error memproses order.');
   }
-});
 
-// Health check endpoint (Keep-Alive)
-app.get('/', (req, res) => {
-  res.json({
-    status: 'ONLINE',
-    service: 'Tokocrypto AI Trader 24/7 Cloud Bot',
-    uptime: process.uptime(),
-    timestamp: new Date().toISOString()
-  });
-});
+  return res.status(200).send('OK');
+}
 
-app.get('/health', (req, res) => res.send('OK'));
+// Routes Register
+app.get('/', (req, res) => res.json({ status: 'ONLINE', service: 'Tokocrypto AI Trader 24/7 Cloud Bot' }));
+app.all('/api/cron', handleMarketAnalysis);
+app.all('/cron', handleMarketAnalysis);
+app.all('/api/news', handleNewsDigest);
+app.all('/news', handleNewsDigest);
+app.all('/api/webhook', handleWebhook);
+app.all('/webhook', handleWebhook);
 
-// Jadwal Cron
-// 1. Analisa Pasar Tiap 15 Menit
-cron.schedule('*/15 * * * *', () => {
-  runMarketAnalysis();
-});
+// Export for Vercel Serverless & Local
+module.exports = app;
 
-// 2. Monitoring Saldo Harian Tiap Jam 08:00
-cron.schedule('0 8 * * *', async () => {
-  try {
-    const spot = await tokoSignedRequest('/open/v1/account/spot');
-    const assets = (spot.data?.data?.accountAssets || []).filter(a => parseFloat(a.free) > 0 || parseFloat(a.locked) > 0);
-    let text = `🛡️ *Laporan Saldo Portofolio Harian*\n\n`;
-    assets.forEach(a => {
-      text += `• *${a.asset}*: ${parseFloat(a.free).toFixed(4)} (Terkunci: ${parseFloat(a.locked).toFixed(4)})\n`;
-    });
-    await sendTelegram(text);
-  } catch (e) {}
-});
-
-// Start Server & Register Telegram Webhook
-app.listen(PORT, async () => {
-  console.log(`AI Trader 24/7 Cloud Bot running on port ${PORT}`);
-
-  if (APP_URL && TELEGRAM_BOT_TOKEN) {
-    const webhookUrl = `${APP_URL.replace(/\/$/, '')}/webhook`;
-    console.log('Registering Telegram Webhook to:', webhookUrl);
-    await request(
-      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' }
-      },
-      { url: webhookUrl }
-    );
-  }
-
-  // Kirim notifikasi bot baru aktif
-  await sendTelegram(`🚀 *Bot AI Trader Tokocrypto Telah Aktif di Cloud (24/7)*\n\nSistem siap memantau pasar dan menerima tombol trading.`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => console.log(`Bot running on port ${PORT}`));
+}
