@@ -69,15 +69,17 @@ async function tokoSignedRequest(endpoint, queryParams = {}, method = 'GET') {
 }
 
 module.exports = async function handler(req, res) {
-  console.log('[VERCEL CRON 15M] Running Market Analysis...');
+  console.log('[CRON 5M] Menjalankan Cek Pasar Berkala (Anti-Spam Filter Aktif)...');
 
   try {
+    // 1. Cek Saldo Dompet Tokocrypto
     const spot = await tokoSignedRequest('/open/v1/account/spot');
     const assets = spot.data?.data?.accountAssets || [];
     const idrAsset = assets.find(a => a.asset === 'BIDR' || a.asset === 'IDR');
     const idrFree = idrAsset ? parseFloat(idrAsset.free) : 0;
     const availableBuy = Math.min(idrFree > 0 ? idrFree : MODAL_MAX_IDR, MODAL_MAX_IDR);
 
+    // Cek apakah sedang memegang koin kripto selain IDR & USDT
     const heldCoin = assets.find(a => a.asset !== 'BIDR' && a.asset !== 'IDR' && a.asset !== 'USDT' && parseFloat(a.free) > 0);
     let mode = 'CARI_PELUANG_BARU';
     let symbol = 'BTC_IDR';
@@ -91,22 +93,47 @@ module.exports = async function handler(req, res) {
       coinQty = parseFloat(heldCoin.free);
     }
 
+    // 2. Ambil Harga Live Tokocrypto
     const depth = await request(`https://www.tokocrypto.com/open/v1/market/depth?symbol=${symbol}&limit=5`);
     const lastPrice = depth.data?.data?.bids?.[0]?.[0] || '1400000000';
+    const numPrice = Number(lastPrice);
 
+    // 3. Ambil 100 Candlestick & Hitung Indikator SMA (7 & 25)
     const klinesRes = await request(`https://api.binance.com/api/v3/klines?symbol=${binanceSymbol}&interval=1h&limit=100`);
     const klines = Array.isArray(klinesRes.data) ? klinesRes.data : [];
     const closes = klines.map(k => parseFloat(k[4]));
 
     const sma7 = (closes.slice(-7).reduce((a, b) => a + b, 0) / 7) || 0;
     const sma25 = (closes.slice(-25).reduce((a, b) => a + b, 0) / 25) || 0;
-    const trend = sma7 > sma25 ? 'BULLISH' : 'BEARISH';
+    const isGoldenCross = sma7 > sma25;
+    const trend = isGoldenCross ? 'BULLISH' : 'BEARISH';
 
-    let action = trend === 'BULLISH' ? (mode === 'EVALUASI_KOIN_DIPEGANG' ? 'HOLD' : 'BUY') : (mode === 'EVALUASI_KOIN_DIPEGANG' ? 'SELL' : 'HOLD');
-    let reason = `Indikator SMA7 (${sma7.toFixed(2)}) vs SMA25 (${sma25.toFixed(2)}) mendeteksi momentum ${trend}.`;
+    // 4. Analisa Keputusan AI
+    let action = 'HOLD';
+    let reason = 'Pasar dalam kondisi netral/konsolidasi.';
 
+    if (mode === 'CARI_PELUANG_BARU') {
+      if (isGoldenCross) {
+        action = 'BUY';
+        reason = `Terjadi Golden Cross SMA7 (${sma7.toFixed(2)}) menembus ke atas SMA25 (${sma25.toFixed(2)}). Momentum Bullish potensial cuan.`;
+      } else {
+        action = 'HOLD';
+        reason = `Indikator SMA masih Bearish (${sma7.toFixed(2)} < ${sma25.toFixed(2)}). Menunggu titik masuk terbaik.`;
+      }
+    } else {
+      // Sedang memegang koin: Evaluasi potensi Take Profit / Stop
+      if (!isGoldenCross) {
+        action = 'SELL';
+        reason = `Momentum berbalik Bearish (Death Cross SMA7 < SMA25). Rekomendasi jual untuk amankan modal/profit.`;
+      } else {
+        action = 'HOLD';
+        reason = `Tren masih Bullish kuat. Tetap HOLD untuk memaksimalkan cuan.`;
+      }
+    }
+
+    // Konsultasi Tambahan ke Gemini 3.6 Flash
     if (GEMINI_API_KEY) {
-      const prompt = `Data teknikal: symbol=${symbol}, harga terakhir=Rp${Number(lastPrice).toLocaleString('id-ID')}, SMA7=${sma7.toFixed(2)}, SMA25=${sma25.toFixed(2)}, trend=${trend}. Status akun: ${mode}. Modal trading: Rp${availableBuy.toLocaleString('id-ID')}. Berikan rekomendasi (${mode === 'CARI_PELUANG_BARU' ? 'BUY atau HOLD' : 'SELL atau HOLD'}) dan alasan profesional maks 2 kalimat. Balas HANYA JSON: {"action":"BUY|SELL|HOLD","reason":"alasan"}`;
+      const prompt = `Data teknikal: symbol=${symbol}, harga terakhir=Rp${numPrice.toLocaleString('id-ID')}, SMA7=${sma7.toFixed(2)}, SMA25=${sma25.toFixed(2)}, trend=${trend}. Status posisi: ${mode}. Modal: Rp${availableBuy.toLocaleString('id-ID')}. Berikan rekomendasi (${mode === 'CARI_PELUANG_BARU' ? 'BUY atau HOLD' : 'SELL atau HOLD'}) dan alasan ringkas maks 2 kalimat. Format HANYA JSON: {"action":"BUY|SELL|HOLD","reason":"alasan"}`;
       const aiRes = await request(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${GEMINI_API_KEY}`,
         {
@@ -126,39 +153,63 @@ module.exports = async function handler(req, res) {
       } catch (e) {}
     }
 
+    console.log(`[HASIL ANALISA] Mode: ${mode} | Simbol: ${symbol} | Aksi: ${action} | Tren: ${trend}`);
+
+    // =========================================================================
+    // 🛡️ ANTI-SPAM FILTER: HANYA KIRIM CHAT JIKA ADA SINYAL CUAN (BUY / SELL)
+    // =========================================================================
+    if (action === 'HOLD') {
+      console.log('[ANTI-SPAM] Rekomendasi HOLD. Tidak mengirim notifikasi ke Telegram agar chat tidak banjir.');
+      return res.status(200).json({
+        success: true,
+        notified: false,
+        action: 'HOLD',
+        message: 'Kondisi pasar HOLD (Silent Mode - Tidak kirim spam Telegram)'
+      });
+    }
+
+    // Jika Aksi adalah BUY atau SELL, baru kirim konfirmasi lengkap ke Telegram!
     let buttons;
-    let statusLabel;
-    if (mode === 'EVALUASI_KOIN_DIPEGANG') {
-      statusLabel = `Sedang memegang ${coinQty} ${heldCoin.asset}`;
+    let titleHeader;
+
+    if (action === 'BUY') {
+      titleHeader = `🚀 *PELUANG CUAN DETECTED (BUY SIGNAL)*`;
       buttons = [
         [
-          { text: '❌ SELL SEMUA', callback_data: `SELL_${symbol}_ALL` },
-          { text: '⏸ HOLD', callback_data: `HOLD_${symbol}_0` }
+          { text: `✅ EKSEKUSI BUY (Rp${availableBuy.toLocaleString('id-ID')})`, callback_data: `BUY_${symbol}_${availableBuy}` },
+          { text: `⏸ ABAIKAN / HOLD`, callback_data: `HOLD_${symbol}_0` }
         ]
       ];
-    } else {
-      statusLabel = 'Kandidat beli baru (belum ada posisi)';
+    } else if (action === 'SELL') {
+      titleHeader = `💰 *SINYAL AMANKAN CUAN / PROFIT (SELL SIGNAL)*`;
       buttons = [
         [
-          { text: `✅ BUY (${action === 'BUY' ? 'Rekomendasi AI' : 'Manual'})`, callback_data: `BUY_${symbol}_${availableBuy}` },
-          { text: '⏸ HOLD', callback_data: `HOLD_${symbol}_0` }
+          { text: `❌ EKSEKUSI SELL SEMUA (${coinQty} ${heldCoin.asset})`, callback_data: `SELL_${symbol}_ALL` },
+          { text: `⏸ LANJUTKAN HOLD`, callback_data: `HOLD_${symbol}_0` }
         ]
       ];
     }
 
-    const msg = `📊 *Sinyal Trading AI Tokocrypto (24/7 Vercel Cloud)*\n\n` +
+    const msg = `${titleHeader}\n\n` +
       `Aset: *${symbol}*\n` +
-      `Status: ${statusLabel}\n` +
-      `Harga: *Rp${Number(lastPrice).toLocaleString('id-ID')}*\n` +
-      `Rekomendasi AI: *${action}*\n` +
-      `Alasan: _${reason}_\n\n` +
-      (mode !== 'EVALUASI_KOIN_DIPEGANG' ? `💰 Alokasi Modal: Rp${availableBuy.toLocaleString('id-ID')}\n\n` : '') +
-      `_Otomatis dianalisa 24/7 di Cloud._`;
+      `Harga Terkini: *Rp${numPrice.toLocaleString('id-ID')}*\n` +
+      `Indikator: *${trend}* (SMA7: ${sma7.toFixed(2)} | SMA25: ${sma25.toFixed(2)})\n` +
+      `Analisa AI: _${reason}_\n\n` +
+      (action === 'BUY' ? `💰 Rekomendasi Modal: *Rp${availableBuy.toLocaleString('id-ID')}*\n\n` : `📦 Jumlah Koin: *${coinQty} ${heldCoin?.asset}*\n\n`) +
+      `_Klik tombol di bawah untuk eksekusi langsung ke Tokocrypto:_`;
 
     await sendTelegram(msg, { inline_keyboard: buttons });
-    return res.status(200).json({ success: true, symbol, action, trend });
+    console.log(`[TELEGRAM TERKIRIM] Notifikasi ${action} berhasil dikirim ke pengguna.`);
+
+    return res.status(200).json({
+      success: true,
+      notified: true,
+      symbol,
+      action,
+      trend
+    });
   } catch (err) {
-    console.error('Error in cron:', err.message);
+    console.error('Error in cron handler:', err.message);
     return res.status(500).json({ success: false, error: err.message });
   }
 };
